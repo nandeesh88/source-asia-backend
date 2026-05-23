@@ -1,61 +1,95 @@
+# Source Asia Backend Assignment
 
-
-A single Go HTTP service implementing two parts:
-
-1. **Rate-limited request API** (`POST /request`, `GET /stats`)  
-2. **Product catalog with media** (`/products` CRUD)
+A single Go HTTP service with no external dependencies, implementing a rate-limited request API and a product catalog with media management.
 
 ---
 
-## Quick Start
+## Tech Stack
+
+- Language: Go 1.22
+- Storage: In-memory (maps, slices)
+- Dependencies: Standard library only
+
+---
+
+## Project Structure
+
+```
+source-asia-backend/
+    cmd/server/main.go                  entry point and route registration
+    internal/models/models.go           request and response types
+    internal/ratelimiter/
+        ratelimiter.go                  fixed-window rate limiter
+        ratelimiter_test.go
+    internal/catalog/
+        catalog.go                      product store with validation and pagination
+        catalog_test.go
+    internal/handlers/
+        ratelimit.go                    POST /request, GET /stats
+        catalog.go                      all /products endpoints
+        helpers.go                      shared JSON response helpers
+    scripts/seed.sh                     optional script to seed 1,000 products
+```
+
+---
+
+## Getting Started
+
+Requirements: Go 1.22 or later
 
 ```bash
-# Clone / unzip, then:
 cd source-asia-backend
-go run ./cmd/server          # starts on :8080
+go run ./cmd/server
+```
 
-# Or build a binary first:
-go build -o server ./cmd/server
-./server
+Server starts on port 8080. To use a different port:
 
-# Override port:
+```bash
 PORT=9090 go run ./cmd/server
 ```
 
-**Requirements:** Go 1.22+ (no external dependencies — stdlib only)
+To build a binary:
+
+```bash
+go build -o server ./cmd/server
+./server
+```
 
 ---
 
 ## Running Tests
 
 ```bash
-go test ./...                    # all tests
-go test -race ./...              # with race detector (recommended)
-go test -v ./internal/ratelimiter/...
-go test -v ./internal/catalog/...
+go test ./...
+go test -race ./...
 ```
 
----
-
-## Part 1 – Rate-Limited API
-
-### Design decisions
-
-| Decision | Choice | Reason |
-|---|---|---|
-| Success status | **201 Created** | A new "request record" is created; 201 is semantically correct |
-| Window type | **Fixed 1-minute window** | Simpler to reason about; documented below |
-| Rejected counter | **Cumulative (all-time)** | Easier to audit; window-based accepted count is also returned |
-| Concurrency | `sync.RWMutex` on the user map | Writers acquire full write-lock; readers use read-lock for stats |
-
-**Fixed window:** the window for a user starts at the moment of their first request and expires exactly 60 seconds later.  After expiry the counter resets.  A rolling (sliding) window would be more accurate but requires a per-user ring buffer; fixed windows are the standard choice for most production rate limiters.
+16 tests across the rate limiter and catalog packages, including a concurrency test that fires 50 parallel requests and asserts the accepted count never exceeds the limit.
 
 ---
 
-### `POST /request`
+## Part 1 - Rate-Limited Request API
 
-**Request body**
+### How it works
 
+Each user gets a fixed 1-minute window starting from their first request. Up to 5 requests are accepted within that window. On the 6th request, the server returns 429. After 60 seconds, the window resets and the counter starts fresh.
+
+Concurrency is handled with a `sync.RWMutex`. All counter increments happen inside a write lock, so parallel requests for the same user cannot race past the limit.
+
+Rejected count is cumulative across all windows. Accepted count reflects the current window only.
+
+### Design Decisions
+
+| Decision | Choice |
+|---|---|
+| Success status code | 201 Created — a request record is being created |
+| Window type | Fixed 1-minute window |
+| Rejected counter | Cumulative all-time |
+| Concurrency control | sync.RWMutex on the user map |
+
+### POST /request
+
+Request body:
 ```json
 {
   "user_id": "alice",
@@ -63,8 +97,7 @@ go test -v ./internal/catalog/...
 }
 ```
 
-**Success – 201 Created**
-
+Success response (201):
 ```json
 {
   "status": "accepted",
@@ -74,8 +107,7 @@ go test -v ./internal/catalog/...
 }
 ```
 
-**Rate limited – 429 Too Many Requests**
-
+Rate limited (429):
 ```json
 {
   "error": "rate limit exceeded",
@@ -83,8 +115,7 @@ go test -v ./internal/catalog/...
 }
 ```
 
-**Bad input – 400 Bad Request**
-
+Invalid input (400):
 ```json
 {
   "error": "user_id is required and must not be empty",
@@ -92,10 +123,9 @@ go test -v ./internal/catalog/...
 }
 ```
 
----
+### GET /stats
 
-### `GET /stats`
-
+Response (200):
 ```json
 {
   "users": [
@@ -104,85 +134,75 @@ go test -v ./internal/catalog/...
       "accepted_in_window": 3,
       "rejected_total": 1,
       "window_starts_at": "2025-01-15T10:30:00Z",
-      "window_ends_at":   "2025-01-15T10:31:00Z"
+      "window_ends_at": "2025-01-15T10:31:00Z"
     }
   ],
   "updated_at": "2025-01-15T10:30:45Z"
 }
 ```
 
-| Field | Description |
-|---|---|
-| `accepted_in_window` | Accepted requests in the **current** 1-minute window |
-| `rejected_total` | **Cumulative** rejections across all windows, all time |
-| `window_starts_at` / `window_ends_at` | The open/close time of the user's current window |
+`accepted_in_window` reflects the current 1-minute window. `rejected_total` is cumulative across all time.
 
----
-
-### Part 1 – curl examples
+### curl Examples
 
 ```bash
-# Accept 5 requests
+# Send 5 accepted requests
 for i in 1 2 3 4 5; do
   curl -s -X POST http://localhost:8080/request \
     -H "Content-Type: application/json" \
-    -d '{"user_id":"alice","payload":{"order_id":'$i'}}' | jq .
+    -d "{\"user_id\":\"alice\",\"payload\":{\"order_id\":$i}}"
 done
 
-# 6th request → 429
+# 6th request — expect 429
 curl -s -X POST http://localhost:8080/request \
   -H "Content-Type: application/json" \
-  -d '{"user_id":"alice","payload":{}}' | jq .
+  -d '{"user_id":"alice","payload":{}}'
 
-# View stats
-curl -s http://localhost:8080/stats | jq .
+# Check stats
+curl -s http://localhost:8080/stats
 
-# Bad request (missing user_id)
+# Invalid request — expect 400
 curl -s -X POST http://localhost:8080/request \
   -H "Content-Type: application/json" \
-  -d '{"payload":"hello"}' | jq .
+  -d '{"payload":"hello"}'
 ```
 
----
+### Production Limitations
 
-### Production limitations (Part 1)
-
-| Limitation | Description |
+| Limitation | Detail |
 |---|---|
-| **Single instance only** | Rate-limit state lives in the Go process heap; two instances have independent counters and together allow 10 req/min per user |
-| **Restart = state reset** | Window counters and rejection history are lost on restart |
-| **No persistence** | Cannot audit historical request counts |
-| **Multi-instance deployment** | Requires a shared external store (Redis with `INCR` + `EXPIRE`, or a distributed rate-limiter sidecar) |
-| **No user authentication** | Any caller can use any `user_id` string |
+| Single instance only | State lives in the Go process. Two instances each allow 5 req/min, effectively doubling the limit. |
+| Restart loses state | All counters and window timers are reset on restart. |
+| No persistence | Request history cannot be audited after the fact. |
+| Multi-instance deployment | Requires a shared external store such as Redis using INCR and EXPIRE commands. |
+| No authentication | Any caller can pass any user_id string. |
 
 ---
 
-## Part 2 – Product Catalog
+## Part 2 - Product Catalog with Media
 
-### Data model
-
-Products are stored in a single `map[string]*Product` keyed by ID.
+### Data Model
 
 ```
 Store
-├── products  map[id → *Product]   full struct with all URL slices
-├── skuIndex  map[sku → id]        fast duplicate-SKU detection  O(1)
-└── order     []string             insertion-order IDs for stable pagination
+    products    map[id] to *Product     full struct including all URL slices
+    skuIndex    map[sku] to id          O(1) duplicate SKU detection
+    order       []string                insertion-order IDs for stable pagination
 ```
 
-### List vs Detail queries
+### List vs Detail
 
-| Query | What is accessed |
-|---|---|
-| `GET /products` | Iterates `order[offset:offset+limit]`, reads only `ID, Name, SKU, CreatedAt` + `len(ImageURLs)` / `len(VideoURLs)` per product. URL strings are **never allocated or serialised**. |
-| `GET /products/{id}` | Reads the single `*Product` and deep-copies both URL slices. |
+GET /products iterates only the IDs in the requested page window. For each product it reads the scalar fields (id, name, sku, created_at) and the lengths of the URL slices. The URL strings themselves are never allocated or serialised in the list response.
 
-With 1,000 products × 10 images, `GET /products?limit=20` touches 20 products and reads 20 integer lengths — it never serialises 10,000 URL strings.
+GET /products/{id} reads the single product and returns the full URL arrays.
 
-### Production (PostgreSQL + CDN)
+With 1,000 products and 10 images each, a request for `GET /products?limit=20` touches 20 products and reads 20 integer lengths. It does not load or serialise the 10,000 stored URL strings.
+
+### Production Design (PostgreSQL + CDN)
+
+In production, products and media would be stored in separate tables. The list query would use COUNT aggregates against the media table — never fetching URL strings. The detail query would run a second targeted query to fetch media rows for that one product.
 
 ```sql
--- products table (scalar fields only)
 CREATE TABLE products (
   id         UUID PRIMARY KEY,
   name       TEXT NOT NULL,
@@ -190,86 +210,70 @@ CREATE TABLE products (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- media table (separate, not joined in list query)
 CREATE TABLE product_media (
   id         BIGSERIAL PRIMARY KEY,
   product_id UUID REFERENCES products(id) ON DELETE CASCADE,
-  kind       TEXT CHECK (kind IN ('image','video')),
+  kind       TEXT CHECK (kind IN ('image', 'video')),
   url        TEXT NOT NULL,
-  position   INT  NOT NULL DEFAULT 0
+  position   INT NOT NULL DEFAULT 0
 );
 
--- List query: COUNT aggregates, no URL strings loaded
+-- List query: aggregates only, no URL strings loaded
 SELECT p.id, p.name, p.sku, p.created_at,
-       COUNT(CASE WHEN m.kind='image' THEN 1 END) AS image_count,
-       COUNT(CASE WHEN m.kind='video' THEN 1 END) AS video_count,
-       MIN(CASE WHEN m.kind='image' AND m.position=0 THEN m.url END) AS thumbnail_url
+       COUNT(CASE WHEN m.kind = 'image' THEN 1 END) AS image_count,
+       COUNT(CASE WHEN m.kind = 'video' THEN 1 END) AS video_count,
+       MIN(CASE WHEN m.kind = 'image' AND m.position = 0 THEN m.url END) AS thumbnail_url
 FROM products p
 LEFT JOIN product_media m ON m.product_id = p.id
 GROUP BY p.id
 ORDER BY p.created_at DESC
 LIMIT $1 OFFSET $2;
 
--- Detail query: separate second query for media URLs
-SELECT kind, url FROM product_media WHERE product_id=$1 ORDER BY kind, position;
+-- Detail query: fetch media separately for the requested product only
+SELECT kind, url FROM product_media WHERE product_id = $1 ORDER BY kind, position;
 ```
 
-CDN URLs are stored as plain strings; actual file hosting is outside this service.  A pre-signed URL or CDN path rewrite layer would sit in front.
+### POST /products
 
----
-
-### Endpoints
-
-#### `POST /products` – Create product
-
-```bash
-curl -s -X POST http://localhost:8080/products \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Widget A",
-    "sku": "SKU-0001",
-    "image_urls": [
-      "https://cdn.example.com/products/sku-0001/img-1.jpg",
-      "https://cdn.example.com/products/sku-0001/img-2.jpg"
-    ],
-    "video_urls": [
-      "https://cdn.example.com/products/sku-0001/demo.mp4"
-    ]
-  }' | jq .
+Request body:
+```json
+{
+  "name": "Widget A",
+  "sku": "SKU-0001",
+  "image_urls": [
+    "https://cdn.example.com/products/sku-0001/img-1.jpg",
+    "https://cdn.example.com/products/sku-0001/img-2.jpg"
+  ],
+  "video_urls": [
+    "https://cdn.example.com/products/sku-0001/demo.mp4"
+  ]
+}
 ```
 
-**Response – 201 Created**
-
+Success response (201):
 ```json
 {
   "id": "prod_000001",
   "name": "Widget A",
   "sku": "SKU-0001",
-  "image_urls": ["https://cdn.example.com/products/sku-0001/img-1.jpg", "..."],
+  "image_urls": ["https://cdn.example.com/products/sku-0001/img-1.jpg"],
   "video_urls": ["https://cdn.example.com/products/sku-0001/demo.mp4"],
   "created_at": "2025-01-15T10:30:00Z"
 }
 ```
 
-Duplicate SKU → **409 Conflict**
+Duplicate SKU returns 409 Conflict.
 
----
+### GET /products
 
-#### `GET /products` – List products
+Query parameters:
 
-```bash
-curl -s "http://localhost:8080/products?limit=10&offset=0" | jq .
-```
+| Parameter | Default | Max |
+|---|---|---|
+| limit | 20 | 100 |
+| offset | 0 | — |
 
-**Query parameters**
-
-| Parameter | Default | Max | Description |
-|---|---|---|---|
-| `limit` | 20 | 100 | Items per page |
-| `offset` | 0 | — | Zero-based skip count |
-
-**Response – 200 OK**
-
+Response (200):
 ```json
 {
   "products": [
@@ -284,98 +288,56 @@ curl -s "http://localhost:8080/products?limit=10&offset=0" | jq .
     }
   ],
   "total": 1,
-  "limit": 10,
+  "limit": 20,
   "offset": 0
 }
 ```
 
-Note: `image_urls` and `video_urls` are deliberately absent from list items.
+`image_urls` and `video_urls` are intentionally excluded from list items.
 
----
+### GET /products/{id}
 
-#### `GET /products/{id}` – Get product detail
+Returns the full product with all image and video URLs. Returns 404 if the id does not exist.
 
 ```bash
-curl -s http://localhost:8080/products/prod_000001 | jq .
+curl -s http://localhost:8080/products/prod_000001
 ```
 
-Returns full product including all URL arrays. `404` if not found.
+### POST /products/{id}/media
 
----
-
-#### `POST /products/{id}/media` – Add media
+Appends new URLs to an existing product. At least one of `image_urls` or `video_urls` must be provided. Returns 404 if the product does not exist, 400 if the body is empty.
 
 ```bash
 curl -s -X POST http://localhost:8080/products/prod_000001/media \
   -H "Content-Type: application/json" \
   -d '{
-    "image_urls": ["https://cdn.example.com/products/sku-0001/img-3.jpg"],
-    "video_urls": ["https://cdn.example.com/products/sku-0001/tour.mp4"]
-  }' | jq .
+    "image_urls": ["https://cdn.example.com/products/sku-0001/img-3.jpg"]
+  }'
 ```
 
-Returns the updated full product. `404` if unknown id. `400` if no URLs given.
+### Validation Rules
 
----
-
-### Validation rules
-
-| Rule | Detail |
+| Field | Rule |
 |---|---|
-| `name` | Required, non-empty after trimming whitespace |
-| `sku` | Required, non-empty, unique across all products |
-| URL scheme | Must be `http://` or `https://` |
+| name | Required, non-empty after trimming whitespace |
+| sku | Required, non-empty, unique across all products |
+| URL scheme | Must be http or https |
 | URL length | Maximum 2,048 characters |
-| URL format | Must have a valid host |
-| Max URLs per request | 20 per `image_urls`, 20 per `video_urls` |
+| URLs per request | Maximum 20 per image_urls array, 20 per video_urls array |
 
----
-
-### Seeding 1,000 products (optional performance test)
+### Seed Script (Optional Performance Test)
 
 ```bash
-# Start the server first, then:
+# Start the server, then run:
 bash scripts/seed.sh
 
-# Or point at a different host:
-bash scripts/seed.sh http://localhost:9090
-
-# After seeding, verify the list query is fast and correct:
-curl -s "http://localhost:8080/products?limit=20&offset=0" | jq '.total, (.products | length)'
-# → 1000
-# → 20
+# Creates 1,000 products with 10 images and 2 videos each.
+# After seeding, verify the list endpoint is fast:
+curl -s "http://localhost:8080/products?limit=20&offset=0"
 ```
 
 ---
 
 ## AI Usage
 
-Claude (Anthropic) was used to assist in writing this implementation. All code was reviewed for correctness, concurrency safety, and alignment with the assignment requirements.
-
----
-
-## Repository structure
-
-```
-source-asia-backend/
-├── cmd/
-│   └── server/
-│       └── main.go          # entry point, route wiring
-├── internal/
-│   ├── models/
-│   │   └── models.go        # all request/response types
-│   ├── ratelimiter/
-│   │   ├── ratelimiter.go   # Part 1 logic
-│   │   └── ratelimiter_test.go
-│   ├── catalog/
-│   │   ├── catalog.go       # Part 2 store
-│   │   └── catalog_test.go
-│   └── handlers/
-│       ├── ratelimit.go     # HTTP handlers – Part 1
-│       ├── catalog.go       # HTTP handlers – Part 2
-│       └── helpers.go       # shared JSON helpers
-├── scripts/
-│   └── seed.sh              # optional 1,000-product seeder
-├── go.mod
-└── README.md
-```
+Claude (Anthropic) was used to generate the initial code structure, implement the rate limiter and catalog logic, and write tests. GitHub Copilot was used within VS Code for debugging, inline suggestions, and refining implementation details. All generated code was reviewed for correctness and alignment with the assignment requirements.
