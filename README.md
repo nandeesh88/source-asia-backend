@@ -1,4 +1,4 @@
-# Source Asia Backend Assignment
+# Source Asia Backend 
 
 A single Go HTTP service with no external dependencies, implementing a rate-limited request API and a product catalog with media management.
 
